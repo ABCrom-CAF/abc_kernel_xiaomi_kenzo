@@ -1445,6 +1445,17 @@ unsigned int sysctl_sched_upmigrate_pct = 80;
 unsigned int sched_downmigrate;
 unsigned int sysctl_sched_downmigrate_pct = 60;
 
+bool __read_mostly sched_use_shadow_scheduling = true; //Default Active
+int __read_mostly sysctl_sched_use_shadow_scheduling = 1; //Default Active
+
+unsigned int __read_mostly sched_shadow_upmigrate;
+unsigned int __read_mostly sysctl_sched_shadow_upmigrate_pct = 50;
+
+unsigned int __read_mostly sched_shadow_downmigrate;
+unsigned int __read_mostly sysctl_sched_shadow_downmigrate_pct = 30;
+
+bool sched_shadow_active;
+
 /*
  * Tasks whose nice value is > sysctl_sched_upmigrate_min_nice are never
  * considered as "big" tasks.
@@ -1479,6 +1490,12 @@ void update_up_down_migrate(void)
 	unsigned int up_migrate = pct_to_real(sysctl_sched_upmigrate_pct);
 	unsigned int down_migrate = pct_to_real(sysctl_sched_downmigrate_pct);
 	unsigned int delta;
+
+	sched_shadow_upmigrate =
+		pct_to_real(sysctl_sched_shadow_upmigrate_pct);
+
+	sched_shadow_downmigrate =
+		pct_to_real(sysctl_sched_shadow_downmigrate_pct);
 
 	if (up_down_migrate_scale_factor == 1024)
 		goto done;
@@ -1643,6 +1660,22 @@ static inline int upmigrate_discouraged(struct task_struct *p)
 
 #endif
 
+static __always_inline int get_shadow_based_sched_upmigrate(void)
+{
+	if (sched_shadow_active)
+		return sched_shadow_upmigrate;
+	else
+		return sched_upmigrate;
+}
+
+static __always_inline int get_shadow_based_sched_downmigrate(void)
+{
+	if (sched_shadow_active)
+		return sched_shadow_downmigrate;
+	else
+		return sched_downmigrate;
+}
+
 /* Is a task "big" on its current cpu */
 static inline int is_big_task(struct task_struct *p)
 {
@@ -1654,7 +1687,7 @@ static inline int is_big_task(struct task_struct *p)
 
 	load = scale_load_to_cpu(load, task_cpu(p));
 
-	return load > sched_upmigrate;
+	return load > get_shadow_based_sched_upmigrate();
 }
 
 /* Is a task "small" on the minimum capacity CPU */
@@ -1786,6 +1819,18 @@ int sched_set_boost(int enable)
 	return ret;
 }
 
+void sched_set_shadow_active(bool active)
+{
+	if (sched_shadow_active != active && sched_use_shadow_scheduling) {
+		/* Force scheduler to reclassify the tasks because the sched_shadow_active state changed */
+		get_online_cpus();
+		pre_big_small_task_count_change(cpu_online_mask);
+		sched_shadow_active = active;
+		post_big_small_task_count_change(cpu_online_mask);
+		put_online_cpus();
+	}
+}
+
 int sched_boost_handler(struct ctl_table *table, int write,
 		void __user *buffer, size_t *lenp,
 		loff_t *ppos)
@@ -1833,9 +1878,9 @@ static int task_load_will_fit(struct task_struct *p, u64 task_load, int cpu)
 		if (nice > sched_upmigrate_min_nice || upmigrate_discouraged(p))
 			return 1;
 
-		upmigrate = sched_upmigrate;
+		upmigrate = get_shadow_based_sched_upmigrate();
 		if (cpu_capacity(prev_cpu) > cpu_capacity(cpu))
-			upmigrate = sched_downmigrate;
+			upmigrate = get_shadow_based_sched_downmigrate();
 
 		if (task_load < upmigrate)
 			return 1;
@@ -2843,6 +2888,7 @@ int sched_hmp_proc_update_handler(struct ctl_table *table, int write,
 	unsigned int old_val;
 	unsigned int *data = (unsigned int *)table->data;
 	int update_min_nice = 0;
+	bool force_reclassify = false;
 
 	mutex_lock(&policy_mutex);
 
@@ -2855,6 +2901,21 @@ int sched_hmp_proc_update_handler(struct ctl_table *table, int write,
 
 	if (write && (old_val == *data))
 		goto done;
+
+	if (data == (unsigned int *)&sysctl_sched_use_shadow_scheduling) {
+		if (sysctl_sched_use_shadow_scheduling > 0) {
+			sched_use_shadow_scheduling = true;
+			/* Avoid values bigger than one to show up
+			   in the sysfs node */
+			sysctl_sched_use_shadow_scheduling = 1;
+		} else {
+			/* Also handle the case of shadow being active
+			   in this moment */
+			sched_set_shadow_active(false);
+			sched_use_shadow_scheduling = false;
+		}
+		goto done;
+	}
 
 	if (data == &sysctl_sched_min_runtime) {
 		sched_min_runtime = ((u64) sysctl_sched_min_runtime) * 1000;
@@ -2888,12 +2949,42 @@ int sched_hmp_proc_update_handler(struct ctl_table *table, int write,
 		update_min_nice = 1;
 	} else {
 		/* all tunables other than min_nice are in percentage */
-		if (sysctl_sched_downmigrate_pct >
-		    sysctl_sched_upmigrate_pct || *data > 100) {
+		if ((sysctl_sched_downmigrate_pct >
+			sysctl_sched_upmigrate_pct)
+		     || (sysctl_sched_shadow_downmigrate_pct >
+			sysctl_sched_shadow_upmigrate_pct)
+		     || *data > 100) {
 			*data = old_val;
 			ret = -EINVAL;
 			goto done;
 		}
+	}
+
+	/* Evaluate whether we need to force a reclassification
+	   of tasks based on sched_shadow_active */
+
+	/* If sched_upmigrate_min_nice changed we need a
+	   reclassification regardless of shadow. */
+	if (update_min_nice)
+		force_reclassify = true;
+
+	/* If sched_small_task changed we need a
+	   reclassification regardless of shadow. */
+	if (data == &sysctl_sched_small_task_pct)
+		force_reclassify = true;
+
+	/* If shadow is active only force a reclassification
+	   for shadow values and if shadow is inactive only
+	   force a reclassification for non-shadow values.
+	   This is safe since the handler of shadow activity
+	   takes care of a possible reclassification when shadow
+	   activity changes. */
+	if (sched_shadow_active) {
+		if (data == &sysctl_sched_shadow_upmigrate_pct)
+			force_reclassify = true;
+	} else {
+		if (data == &sysctl_sched_upmigrate_pct)
+			force_reclassify = true;
 	}
 
 	/*
@@ -2904,16 +2995,14 @@ int sched_hmp_proc_update_handler(struct ctl_table *table, int write,
 	 * includes taking runqueue lock of all online cpus and re-initiatizing
 	 * their big/small counter values based on changed criteria.
 	 */
-	if ((data == &sysctl_sched_upmigrate_pct ||
-	     data == &sysctl_sched_small_task_pct || update_min_nice)) {
+	if (force_reclassify) {
 		get_online_cpus();
 		pre_big_small_task_count_change(cpu_online_mask);
 	}
 
 	set_hmp_defaults();
 
-	if ((data == &sysctl_sched_upmigrate_pct ||
-	     data == &sysctl_sched_small_task_pct || update_min_nice)) {
+	if (force_reclassify) {
 		post_big_small_task_count_change(cpu_online_mask);
 		put_online_cpus();
 	}
@@ -3922,6 +4011,12 @@ static void check_spread(struct cfs_rq *cfs_rq, struct sched_entity *se)
 #endif
 }
 
+static unsigned int Lgentle_fair_sleepers = 1;
+void relay_gfs(unsigned int gfs)
+{
+	Lgentle_fair_sleepers = gfs;
+}
+
 static void
 place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int initial)
 {
@@ -3944,7 +4039,7 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int initial)
 		 * Halve their sleep time's effect, to allow
 		 * for a gentler effect of sleepers:
 		 */
-		if (sched_feat(GENTLE_FAIR_SLEEPERS))
+		if (Lgentle_fair_sleepers)
 			thresh >>= 1;
 
 		vruntime -= thresh;
@@ -3959,25 +4054,17 @@ static void check_enqueue_throttle(struct cfs_rq *cfs_rq);
 static void
 enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 {
-	bool renorm = !(flags & ENQUEUE_WAKEUP) || (flags & ENQUEUE_WAKING);
-	bool curr = cfs_rq->curr == se;
-
 	/*
-	 * If we're the current task, we must renormalise before calling
-	 * update_curr().
+	 * Update the normalized vruntime before updating min_vruntime
+	 * through callig update_curr().
 	 */
-	if (renorm && curr)
+	if (!(flags & ENQUEUE_WAKEUP) || (flags & ENQUEUE_WAKING))
 		se->vruntime += cfs_rq->min_vruntime;
 
+	/*
+	 * Update run-time statistics of the 'current'.
+	 */
 	update_curr(cfs_rq);
-
-	/*
-	 * Otherwise, renormalise after, such that we're placed at the current
-	 * moment in time, instead of some random moment in the past.
-	 */
-	if (renorm && !curr)
-		se->vruntime += cfs_rq->min_vruntime;
-
 	enqueue_entity_load_avg(cfs_rq, se, flags & ENQUEUE_WAKEUP);
 	account_entity_enqueue(cfs_rq, se);
 	update_cfs_shares(cfs_rq);
@@ -3989,7 +4076,7 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 
 	update_stats_enqueue(cfs_rq, se, !!(flags & ENQUEUE_MIGRATING));
 	check_spread(cfs_rq, se);
-	if (!curr)
+	if (se != cfs_rq->curr)
 		__enqueue_entity(cfs_rq, se);
 	se->on_rq = 1;
 
@@ -4896,6 +4983,26 @@ static void check_enqueue_throttle(struct cfs_rq *cfs_rq)
 	if (!cfs_bandwidth_used())
 		return;
 
+	/* Synchronize hierarchical throttle counter: */
+	if (unlikely(!cfs_rq->throttle_uptodate)) {
+		struct rq *rq = rq_of(cfs_rq);
+		struct cfs_rq *pcfs_rq;
+		struct task_group *tg;
+
+		cfs_rq->throttle_uptodate = 1;
+
+		/* Get closest up-to-date node, because leaves go first: */
+		for (tg = cfs_rq->tg->parent; tg; tg = tg->parent) {
+			pcfs_rq = tg->cfs_rq[cpu_of(rq)];
+			if (pcfs_rq->throttle_uptodate)
+				break;
+		}
+		if (tg) {
+			cfs_rq->throttle_count = pcfs_rq->throttle_count;
+			cfs_rq->throttled_clock_task = rq_clock_task(rq);
+		}
+	}
+
 	/* an active group must be handled by the update_curr()->put() path */
 	if (!cfs_rq->runtime_enabled || cfs_rq->curr)
 		return;
@@ -5145,7 +5252,7 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 		 *
 		 * note: in the case of encountering a throttled cfs_rq we will
 		 * post the final h_nr_running increment below.
-		*/
+		 */
 		if (cfs_rq_throttled(cfs_rq))
 			break;
 		cfs_rq->h_nr_running++;
@@ -7535,7 +7642,7 @@ static struct rq *find_busiest_queue(struct lb_env *env,
 				     struct sched_group *group)
 {
 	struct rq *busiest = NULL, *rq;
-	unsigned long max_load = 0;
+	unsigned long busiest_load = 0, busiest_power = 1;
 	int i;
 
 	if (sched_enable_hmp)
@@ -7568,11 +7675,15 @@ static struct rq *find_busiest_queue(struct lb_env *env,
 		 * the weighted_cpuload() scaled with the cpu power, so that
 		 * the load can be moved away from the cpu that is potentially
 		 * running at a lower capacity.
+		 *
+		 * Thus we're looking for max(wl_i / power_i), crosswise
+		 * multiplication to rid ourselves of the division works out
+		 * to: wl_i * power_j > wl_j * power_i;  where j is our
+		 * previous maximum.
 		 */
-		wl = (wl * SCHED_POWER_SCALE) / power;
-
-		if (wl > max_load) {
-			max_load = wl;
+		if (wl * busiest_power > busiest_load * power) {
+			busiest_load = wl;
+			busiest_power = power;
 			busiest = rq;
 		}
 	}
@@ -8612,31 +8723,17 @@ static void task_fork_fair(struct task_struct *p)
 {
 	struct cfs_rq *cfs_rq;
 	struct sched_entity *se = &p->se, *curr;
-	int this_cpu = smp_processor_id();
 	struct rq *rq = this_rq();
-	unsigned long flags;
 
-	raw_spin_lock_irqsave(&rq->lock, flags);
-
+	raw_spin_lock(&rq->lock);
 	update_rq_clock(rq);
 
 	cfs_rq = task_cfs_rq(current);
 	curr = cfs_rq->curr;
-
-	/*
-	 * Not only the cpu but also the task_group of the parent might have
-	 * been changed after parent->se.parent,cfs_rq were copied to
-	 * child->se.parent,cfs_rq. So call __set_task_cpu() to make those
-	 * of child point to valid ones.
-	 */
-	rcu_read_lock();
-	__set_task_cpu(p, this_cpu);
-	rcu_read_unlock();
-
-	update_curr(cfs_rq);
-
-	if (curr)
+	if (curr) {
+		update_curr(cfs_rq);
 		se->vruntime = curr->vruntime;
+	}
 	place_entity(cfs_rq, se, 1);
 
 	if (sysctl_sched_child_runs_first && curr && entity_before(curr, se)) {
@@ -8649,8 +8746,7 @@ static void task_fork_fair(struct task_struct *p)
 	}
 
 	se->vruntime -= cfs_rq->min_vruntime;
-
-	raw_spin_unlock_irqrestore(&rq->lock, flags);
+	raw_spin_unlock(&rq->lock);
 }
 
 /*
